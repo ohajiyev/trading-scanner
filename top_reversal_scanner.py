@@ -63,13 +63,35 @@ class ScanConfig:
     atr_period: int = 14
 
     # Volume confirmation
-    min_rvol: float = 2.0            # Aziz's #1 criterion: relative volume >= 2x
+    min_rvol: float = 2.0            # relative volume floor (Aziz Volume Radar = 1.5)
     rvol_lookback_days: int = 50
     min_volume_today: int = 100_000
 
     # Float (optional). None = ignore. Set e.g. 100_000_000 to focus on
     # low-float momentum plays the way Aziz does for his faster setups.
     max_float_shares: float | None = None
+
+    # --- Aziz "stocks in play" selection filters (off by default; presets set
+    #     them to his exact book numbers). ---
+    min_avg_daily_volume: int = 0    # Aziz: average daily volume >= 500,000
+    min_gap_pct: float = 0.0         # Aziz Gappers: gapped up/down >= 2%
+    min_gap_dollar: float = 0.0      # Aziz Volume Radar: gapped up/down >= $1
+    max_short_pct_float: float | None = None  # Aziz: avoid short interest > 30%
+
+    # --- Strategy-specific knobs (only the chosen strategy reads its own) ---
+    # ORB: how many minutes define the opening range (first N min of session).
+    orb_minutes: int = 15
+    # ABCD: B must be this far above A (a real "pole"), and price must be within
+    # new_high_tol of B to count as approaching point D.
+    abcd_min_move_pct: float = 0.04
+    abcd_new_high_tol: float = 0.01
+    # Bull Flag: pole must gain at least this %, then the flag (last few bars)
+    # must stay tighter than max_range_pct.
+    flag_min_pole_pct: float = 0.05
+    flag_max_range_pct: float = 0.03
+    # VWAP pullback: price must be within this band of VWAP (a pullback, not
+    # an extended move) on the correct side.
+    vwap_band_pct: float = 0.006
 
     request_pause: float = 0.3       # be polite to the free data endpoint
 
@@ -153,67 +175,180 @@ def relative_volume(daily: pd.DataFrame, lookback: int = 50) -> float:
     return today_volume / avg
 
 
+def average_daily_volume(daily: pd.DataFrame, lookback: int = 50) -> float:
+    """Average of the prior `lookback` days' volume (today excluded).
+
+    Aziz wants this >= 500,000 — it's a liquidity gate separate from RVOL.
+    """
+    if len(daily) < 2:
+        return float("nan")
+    prior = daily["Volume"].iloc[-(lookback + 1):-1]
+    return float(prior.mean()) if len(prior) else float("nan")
+
+
+def gap_from_prev_close(daily: pd.DataFrame) -> tuple[float, float]:
+    """(gap_percent, gap_dollar) of today's OPEN vs the prior day's CLOSE.
+
+    IMPORTANT: this is the regular-session opening gap. It is NOT the live
+    pre-market gap Aziz screens for — free data can't reliably give pre-market
+    prints — but the open-vs-prior-close gap is the closest faithful proxy.
+    """
+    if len(daily) < 2:
+        return float("nan"), float("nan")
+    today_open = float(daily["Open"].iloc[-1])
+    prev_close = float(daily["Close"].iloc[-2])
+    if prev_close <= 0:
+        return float("nan"), float("nan")
+    gap_dollar = today_open - prev_close
+    return gap_dollar / prev_close * 100, gap_dollar
+
+
+def fetch_float_and_short(ticker) -> tuple[float | None, float | None]:
+    """One .info call returning (float_shares, short_percent_of_float_%).
+
+    Short interest is reported only ~twice a month by the exchanges, so this
+    field is inherently stale even in professional tools — not a Claude/free
+    limitation.
+    """
+    try:
+        info = ticker.info
+    except Exception:
+        return None, None
+    flt = info.get("floatShares") or info.get("sharesOutstanding")
+    sp = info.get("shortPercentOfFloat")
+    return flt, (sp * 100 if sp is not None else None)
+
+
 # --------------------------------------------------------------------------- #
-# SCAN
+# STRATEGY ENGINE
 # --------------------------------------------------------------------------- #
-def scan_symbol(symbol: str, cfg: ScanConfig) -> dict | None:
-    """Return a result row for `symbol` if it passes every filter, else None."""
+# Each strategy is just a "detector": a function
+#     detect(intraday, daily, cfg) -> dict | None
+# It returns the strategy-specific columns (e.g. {"Consec": 5}) when the pattern
+# is present, or None when it isn't. The engine below handles everything shared:
+# the universal "stocks in play" filters (price / ATR / RVOL / volume / float),
+# data fetching, the funnel, and sorting. Add a new strategy by writing one
+# detector — no need to touch the engine. (More detectors live in strategies.py.)
+
+
+def bar_minutes(interval: str) -> int:
+    """Minutes per bar for an interval string like '5m' / '15m'. Defaults to 5."""
+    m = re.fullmatch(r"(\d+)m", interval.strip())
+    return int(m.group(1)) if m else 5
+
+
+def detect_reversal(intraday: pd.DataFrame, daily: pd.DataFrame, cfg: ScanConfig):
+    """Top/Bottom Reversal: N consecutive same-direction candles (exhaustion)."""
+    consec = count_consecutive_candles(intraday, cfg.direction)
+    if consec < cfg.min_consecutive_candles:
+        return None
+    return {"Consec": consec}
+
+
+def _passes_universal_filters(price, atr, rvol, vol_today, avg_vol,
+                              gap_pct, gap_dollar, cfg: ScanConfig) -> bool:
+    """The Aziz 'stocks in play' gates every strategy must clear.
+
+    `not (x >= y)` form makes NaN values fail safely (the symbol is skipped).
+    Each gate is active only when its threshold is set (> 0 / not None), so the
+    base config behaves exactly as before and presets switch the rest on.
+    """
+    if not (cfg.min_price <= price <= cfg.max_price):
+        return False
+    if not (atr >= cfg.min_atr):
+        return False
+    if cfg.min_rvol > 0 and not (rvol >= cfg.min_rvol):
+        return False
+    if not (vol_today >= cfg.min_volume_today):
+        return False
+    if cfg.min_avg_daily_volume > 0 and not (avg_vol >= cfg.min_avg_daily_volume):
+        return False
+    if cfg.min_gap_pct > 0 and not (abs(gap_pct) >= cfg.min_gap_pct):
+        return False
+    if cfg.min_gap_dollar > 0 and not (abs(gap_dollar) >= cfg.min_gap_dollar):
+        return False
+    return True
+
+
+def _evaluate(symbol, intraday, daily, cfg, strategy) -> dict | None:
+    """Apply universal filters + the chosen strategy. Float and short interest
+    are NOT fetched here (the engine fills them for survivors only).
+    Returns a row dict or None."""
+    if intraday is None or daily is None or intraday.empty or daily.empty:
+        return None
+    price = float(intraday["Close"].iloc[-1])
+    atr = average_true_range(daily, cfg.atr_period)
+    rvol = relative_volume(daily, cfg.rvol_lookback_days)
+    vol_today = float(daily["Volume"].iloc[-1])
+    avg_vol = average_daily_volume(daily, cfg.rvol_lookback_days)
+    gap_pct, gap_dollar = gap_from_prev_close(daily)
+    if atr != atr or rvol != rvol:        # NaN check (NaN != NaN)
+        return None
+    if not _passes_universal_filters(price, atr, rvol, vol_today, avg_vol,
+                                     gap_pct, gap_dollar, cfg):
+        return None
+    extra = strategy(intraday, daily, cfg)
+    if extra is None:                     # pattern not present
+        return None
+    row = {
+        "Symbol": symbol,
+        "Price": round(price, 2),
+        "Gap%": round(gap_pct, 2) if gap_pct == gap_pct else None,
+        "ATR": round(atr, 2),
+        "RVOL": round(rvol, 2),
+        "VolToday": int(vol_today),
+        "AvgVol": int(avg_vol) if avg_vol == avg_vol else None,
+        "Float(M)": None,                 # filled later for survivors only
+        "Short%": None,                   # filled later for survivors only
+    }
+    row.update(extra)
+    return row
+
+
+# --------------------------------------------------------------------------- #
+# SCAN  (single symbol + small watchlist)
+# --------------------------------------------------------------------------- #
+def scan_symbol(symbol: str, cfg: ScanConfig | None = None, strategy=None) -> dict | None:
+    """Return a result row for `symbol` if it matches the strategy, else None."""
+    cfg = cfg or ScanConfig()
+    strategy = strategy or detect_reversal
     ticker = yf.Ticker(symbol)
     try:
         intraday = fetch_intraday(ticker, cfg.bar_interval)
         daily = fetch_daily(ticker)
     except Exception:
         return None
-    if intraday.empty or daily.empty:
-        return None
-
-    price = float(intraday["Close"].iloc[-1])
-    consec = count_consecutive_candles(intraday, cfg.direction)
-    atr = average_true_range(daily, cfg.atr_period)
-    rvol = relative_volume(daily, cfg.rvol_lookback_days)
-    vol_today = float(daily["Volume"].iloc[-1])
-    flt = fetch_float_shares(ticker)
-
-    # Filters. The `not (x >= y)` form makes NaN values fail safely (skip).
-    if consec < cfg.min_consecutive_candles:
-        return None
-    if not (cfg.min_price <= price <= cfg.max_price):
-        return None
-    if not (atr >= cfg.min_atr):
-        return None
-    if not (rvol >= cfg.min_rvol):
-        return None
-    if not (vol_today >= cfg.min_volume_today):
-        return None
-    if cfg.max_float_shares is not None and flt is not None and flt > cfg.max_float_shares:
-        return None
-
-    return {
-        "Symbol": symbol,
-        "Consec": consec,
-        "Price": round(price, 2),
-        "Float(M)": round(flt / 1e6, 1) if flt else None,
-        "ATR": round(atr, 2),
-        "VolToday": int(vol_today),
-        "RVOL": round(rvol, 2),
-    }
+    row = _evaluate(symbol, intraday, daily, cfg, strategy)
+    if row is not None:
+        flt, short_pct = fetch_float_and_short(ticker)
+        row["Float(M)"] = round(flt / 1e6, 1) if flt else None
+        row["Short%"] = round(short_pct, 1) if short_pct is not None else None
+        if (cfg.max_float_shares is not None and flt is not None
+                and flt > cfg.max_float_shares):
+            return None
+        if (cfg.max_short_pct_float is not None and short_pct is not None
+                and short_pct > cfg.max_short_pct_float):
+            return None
+    return row
 
 
 def run_scan(
     symbols: list[str],
     cfg: ScanConfig | None = None,
+    strategy=None,
     progress_callback=None,
 ) -> pd.DataFrame:
     """Scan a watchlist and return matches sorted by RVOL (highest first).
 
-    progress_callback(done: int, total: int, symbol: str) is called after each
-    symbol, so a UI (e.g. Streamlit) can show a progress bar. Optional.
+    strategy: a detector function (defaults to detect_reversal).
+    progress_callback(done, total, symbol) is called after each symbol. Optional.
     """
     cfg = cfg or ScanConfig()
+    strategy = strategy or detect_reversal
     rows = []
     total = len(symbols)
     for i, symbol in enumerate(symbols):
-        row = scan_symbol(symbol, cfg)
+        row = scan_symbol(symbol, cfg, strategy)
         if row:
             rows.append(row)
         if progress_callback is not None:
@@ -344,82 +479,105 @@ def _batch_history(
     return out
 
 
+def _prefilter_by_price(
+    symbols: list[str], cfg: ScanConfig, progress=None
+) -> list[str]:
+    """Cheap first pass: keep only symbols whose latest price is in range.
+
+    Downloads just today's single daily bar per stock (one light batch), so it
+    runs fast across the whole market. Price is robust even mid-session, which
+    makes it the ideal one-filter funnel before the heavy downloads.
+    """
+    snapshot = _batch_history(symbols, "1d", "1d", progress=progress)
+    kept = []
+    for sym, df in snapshot.items():
+        try:
+            price = float(df["Close"].iloc[-1])
+        except Exception:
+            continue
+        if cfg.min_price <= price <= cfg.max_price:
+            kept.append(sym)
+    return kept
+
+
 def run_scan_universe(
     symbols: list[str],
     cfg: ScanConfig | None = None,
+    strategy=None,
     max_symbols: int | None = None,
+    quick_prefilter: bool = True,
     fetch_float_for_hits: bool = True,
     progress_callback=None,
 ) -> pd.DataFrame:
     """Batched scan over a large symbol list (e.g. the whole US market).
 
-    Same filters and indicators as run_scan, but built for scale:
-      Phase 1  batch-download intraday + daily bars (no per-symbol float lookup)
-      Phase 2  apply the consecutive-candle / price / ATR / RVOL / volume filters
-      Phase 3  fetch float ONLY for the survivors, then apply the float cap
+    Same universal filters as run_scan, applied via the shared strategy engine,
+    but built for scale as a funnel:
+      Phase 0  QUICK price pre-filter — one light download, drops most stocks
+      Phase 1  heavy download (intraday + 6mo daily) for SURVIVORS only
+      Phase 2  universal filters + the chosen strategy detector
+      Phase 3  fetch float ONLY for the final winners, then apply the float cap
+
+    strategy: a detector function (defaults to detect_reversal).
+    Phase 0 is the speed win: instead of downloading 6 months of data for 6,000
+    stocks, it cheaply narrows to a few hundred first. Set quick_prefilter=False
+    to scan every stock the slow way.
     """
     cfg = cfg or ScanConfig()
+    strategy = strategy or detect_reversal
     if max_symbols is not None:
         symbols = symbols[:max_symbols]
-    n = len(symbols)
-    if n == 0:
+    if not symbols:
         return pd.DataFrame()
 
-    # Phase 1: two batched downloads. Report progress across both as one bar.
+    # Phase 0: quick price pre-filter (the funnel's wide end).
+    if quick_prefilter:
+        before = len(symbols)
+
+        def prefilter_progress(done, total):
+            if progress_callback:
+                progress_callback(done, total, "Quick price filter")
+
+        symbols = _prefilter_by_price(symbols, cfg, progress=prefilter_progress)
+        if progress_callback:
+            progress_callback(
+                len(symbols), before,
+                f"Price filter kept {len(symbols)} of {before}",
+            )
+        if not symbols:
+            return pd.DataFrame()
+
+    # Phase 1: heavy batched downloads — only for the survivors now.
     def intraday_progress(done, total):
         if progress_callback:
-            progress_callback(done, total * 2, "Downloading intraday bars")
+            progress_callback(done, total, "Downloading intraday (survivors)")
 
     def daily_progress(done, total):
         if progress_callback:
-            progress_callback(total + done, total * 2, "Downloading daily bars")
+            progress_callback(done, total, "Downloading daily (survivors)")
 
     intraday = _batch_history(symbols, "1d", cfg.bar_interval, progress=intraday_progress)
     daily = _batch_history(symbols, "6mo", "1d", progress=daily_progress)
 
-    # Phase 2: in-memory filtering (fast, no network).
-    if progress_callback:
-        progress_callback(n * 2, n * 2, "Applying filters")
+    # Phase 2: universal filters + strategy detector (fast, no network).
     hits = []
     for sym in symbols:
-        bars, days = intraday.get(sym), daily.get(sym)
-        if bars is None or days is None or bars.empty or days.empty:
-            continue
-        price = float(bars["Close"].iloc[-1])
-        consec = count_consecutive_candles(bars, cfg.direction)
-        atr = average_true_range(days, cfg.atr_period)
-        rvol = relative_volume(days, cfg.rvol_lookback_days)
-        vol_today = float(days["Volume"].iloc[-1])
+        row = _evaluate(sym, intraday.get(sym), daily.get(sym), cfg, strategy)
+        if row is not None:
+            hits.append(row)
 
-        if consec < cfg.min_consecutive_candles:
-            continue
-        if not (cfg.min_price <= price <= cfg.max_price):
-            continue
-        if not (atr >= cfg.min_atr):
-            continue
-        if not (rvol >= cfg.min_rvol):
-            continue
-        if not (vol_today >= cfg.min_volume_today):
-            continue
-
-        hits.append({
-            "Symbol": sym,
-            "Consec": consec,
-            "Price": round(price, 2),
-            "Float(M)": None,            # filled in Phase 3 if requested
-            "ATR": round(atr, 2),
-            "VolToday": int(vol_today),
-            "RVOL": round(rvol, 2),
-        })
-
-    # Phase 3: float lookup for survivors only (the expensive .info call).
+    # Phase 3: float + short interest for survivors only (one .info call each).
     if fetch_float_for_hits and hits:
         for row in hits:
-            flt = fetch_float_shares(yf.Ticker(row["Symbol"]))
+            flt, short_pct = fetch_float_and_short(yf.Ticker(row["Symbol"]))
             row["Float(M)"] = round(flt / 1e6, 1) if flt else None
+            row["Short%"] = round(short_pct, 1) if short_pct is not None else None
         if cfg.max_float_shares is not None:
             cap_m = cfg.max_float_shares / 1e6
             hits = [r for r in hits if r["Float(M)"] is None or r["Float(M)"] <= cap_m]
+        if cfg.max_short_pct_float is not None:
+            hits = [r for r in hits if r["Short%"] is None
+                    or r["Short%"] <= cfg.max_short_pct_float]
 
     df = pd.DataFrame(hits)
     if not df.empty:
