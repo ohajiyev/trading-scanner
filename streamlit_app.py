@@ -15,7 +15,13 @@ import re
 
 import streamlit as st
 
-from top_reversal_scanner import ScanConfig, run_scan, DEFAULT_WATCHLIST
+from top_reversal_scanner import (
+    ScanConfig,
+    run_scan,
+    run_scan_universe,
+    fetch_universe,
+    DEFAULT_WATCHLIST,
+)
 
 st.set_page_config(
     page_title="Reversal Scanner",
@@ -68,11 +74,35 @@ with st.sidebar:
     )
 
     st.divider()
-    watchlist_raw = st.text_area(
-        "Watchlist (comma or space separated)",
-        ", ".join(DEFAULT_WATCHLIST),
-        height=120,
+    universe_mode = st.radio(
+        "Scan universe",
+        ["My watchlist", "All US stocks (slow)"],
+        help="Watchlist = the tickers below (fast). "
+             "All US stocks = the whole market via batched downloads (minutes, "
+             "and may return partial results when Yahoo rate-limits).",
     )
+
+    if universe_mode == "My watchlist":
+        watchlist_raw = st.text_area(
+            "Watchlist (comma or space separated)",
+            ", ".join(DEFAULT_WATCHLIST),
+            height=120,
+        )
+        max_symbols = None
+    else:
+        watchlist_raw = ""
+        st.warning(
+            "Free data is ~15 min delayed and rate-limited. A full scan of "
+            "thousands of stocks takes several minutes and can come back partial. "
+            "Start with the cap below and raise it once you've seen it work."
+        )
+        max_symbols = st.number_input(
+            "Max stocks to scan (0 = no cap, the full market)",
+            value=500, step=250, min_value=0,
+            help="A safety limit so a first run doesn't take 10+ minutes. "
+                 "Set 0 to scan everything once you're comfortable.",
+        )
+        max_symbols = None if max_symbols == 0 else int(max_symbols)
 
 # --------------------------------------------------------------------------- #
 # Build the config from the controls
@@ -92,51 +122,76 @@ cfg = ScanConfig(
 )
 
 setup_name = "Top" if direction == "up" else "Bottom"
-st.write(
-    f"**{len(symbols)} symbols** · {setup_name} Reversal · "
-    f"{min_consec}+ candles · RVOL ≥ {min_rvol}"
-)
+
+
+@st.cache_data(ttl=3600, show_spinner="Fetching the US stock list…")
+def load_universe():
+    """Download the full US ticker list once per hour (cached)."""
+    return fetch_universe()
+
+
+if universe_mode == "My watchlist":
+    st.write(
+        f"**{len(symbols)} symbols** · {setup_name} Reversal · "
+        f"{min_consec}+ candles · RVOL ≥ {min_rvol}"
+    )
+else:
+    cap_text = "full market" if max_symbols is None else f"first {max_symbols}"
+    st.write(
+        f"**All US stocks** ({cap_text}) · {setup_name} Reversal · "
+        f"{min_consec}+ candles · RVOL ≥ {min_rvol}"
+    )
 
 # --------------------------------------------------------------------------- #
 # Run
 # --------------------------------------------------------------------------- #
 if st.button("🔍 Run scan", type="primary", use_container_width=True):
-    if not symbols:
-        st.error("Add at least one ticker to the watchlist.")
-    else:
-        bar = st.progress(0.0, text="Starting…")
+    bar = st.progress(0.0, text="Starting…")
 
-        def on_progress(done, total, symbol):
-            bar.progress(done / total, text=f"Scanning {symbol}  ({done}/{total})")
+    def on_progress(done, total, label):
+        pct = min(done / total, 1.0) if total else 0.0
+        bar.progress(pct, text=f"{label}  ({done}/{total})")
 
+    if universe_mode == "My watchlist":
+        if not symbols:
+            st.error("Add at least one ticker to the watchlist.")
+            st.stop()
         results = run_scan(symbols, cfg, progress_callback=on_progress)
-        bar.empty()
+    else:
+        all_symbols = load_universe()
+        st.caption(f"Universe loaded: {len(all_symbols):,} US common stocks.")
+        results = run_scan_universe(
+            all_symbols, cfg, max_symbols=max_symbols, progress_callback=on_progress
+        )
 
-        if results.empty:
-            st.warning(
-                "No matches right now. Outside US market hours the consecutive-candle "
-                "count goes stale — try lowering **Min RVOL** or **Min consecutive "
-                "candles**, or scan during 09:30–16:00 ET."
-            )
-        else:
-            st.success(f"{len(results)} match(es) · scanned {dt.datetime.now():%H:%M:%S}")
-            st.dataframe(
-                results,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    # ProgressColumn echoes the screenshot's blue RVOL bar
-                    "RVOL": st.column_config.ProgressColumn(
-                        "RVOL",
-                        min_value=0.0,
-                        max_value=float(max(results["RVOL"].max(), 5.0)),
-                        format="%.2f",
-                    ),
-                    "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
-                    "VolToday": st.column_config.NumberColumn("Vol Today", format="%d"),
-                    "Float(M)": st.column_config.NumberColumn("Float (M)", format="%.1f"),
-                    "ATR": st.column_config.NumberColumn("ATR", format="$%.2f"),
-                },
-            )
+    bar.empty()
+
+    if results.empty:
+        st.warning(
+            "No matches right now. Outside US market hours the consecutive-candle "
+            "count goes stale — try lowering **Min RVOL** or **Min consecutive "
+            "candles**, or scan during 09:30–16:00 ET. (A full-market scan can also "
+            "come back empty if Yahoo rate-limited the downloads — just retry.)"
+        )
+    else:
+        st.success(f"{len(results)} match(es) · scanned {dt.datetime.now():%H:%M:%S}")
+        st.dataframe(
+            results,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                # ProgressColumn echoes the screenshot's blue RVOL bar
+                "RVOL": st.column_config.ProgressColumn(
+                    "RVOL",
+                    min_value=0.0,
+                    max_value=float(max(results["RVOL"].max(), 5.0)),
+                    format="%.2f",
+                ),
+                "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                "VolToday": st.column_config.NumberColumn("Vol Today", format="%d"),
+                "Float(M)": st.column_config.NumberColumn("Float (M)", format="%.1f"),
+                "ATR": st.column_config.NumberColumn("ATR", format="$%.2f"),
+            },
+        )
 else:
     st.info("Set your filters in the sidebar (tap **›** on mobile), then **Run scan**.")

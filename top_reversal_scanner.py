@@ -38,6 +38,7 @@ Best run during or just after US market hours (09:30-16:00 ET).
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 
@@ -219,6 +220,208 @@ def run_scan(
             progress_callback(i + 1, total, symbol)
         time.sleep(cfg.request_pause)
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("RVOL", ascending=False).reset_index(drop=True)
+    return df
+
+
+# --------------------------------------------------------------------------- #
+# SCALE-UP  —  scan the ENTIRE US market instead of a hand-typed watchlist.
+# --------------------------------------------------------------------------- #
+# The honest tradeoff: free Yahoo data is delayed and rate-limited, so a full
+# ~6,000-stock scan is SLOW (minutes) and can return partial results when Yahoo
+# throttles. The three tricks below make it as fast as free data allows:
+#   1. fetch_universe()      -> the real list of US tickers, cleaned of junk
+#   2. _batch_history()      -> download ~150 stocks per request, not 1 at a time
+#   3. run_scan_universe()   -> fetch the slow "float" field ONLY for stocks that
+#                               already passed every other filter (the winners)
+
+# Official NASDAQ symbol directory (covers Nasdaq + NYSE + AMEX). Plain pipe-
+# delimited text, refreshed through each trading day.
+_NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+_OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+
+
+def _parse_symbol_file(text: str, symbol_col: str) -> list[str]:
+    """Pull clean common-stock tickers out of a NASDAQ directory file.
+
+    Drops ETFs, test issues, and anything that isn't a plain 1-5 letter symbol
+    (which removes most warrants/units/rights/preferred share classes). Whatever
+    junk slips through gets filtered later by the price and volume thresholds.
+    """
+    lines = [
+        ln for ln in text.splitlines()
+        if ln.strip() and not ln.startswith("File Creation Time")
+    ]
+    if not lines:
+        return []
+    header = lines[0].split("|")
+    if symbol_col not in header:
+        return []
+    si = header.index(symbol_col)
+    ei = header.index("ETF") if "ETF" in header else None
+    ti = header.index("Test Issue") if "Test Issue" in header else None
+
+    out = []
+    for ln in lines[1:]:
+        parts = ln.split("|")
+        if len(parts) <= si:
+            continue
+        sym = parts[si].strip()
+        if ei is not None and ei < len(parts) and parts[ei].strip() == "Y":
+            continue  # skip ETFs
+        if ti is not None and ti < len(parts) and parts[ti].strip() == "Y":
+            continue  # skip test issues
+        if not re.fullmatch(r"[A-Z]{1,5}", sym):
+            continue  # skip warrants/units/rights/odd symbols
+        out.append(sym)
+    return out
+
+
+def fetch_universe() -> list[str]:
+    """Download and clean the full list of US-traded common stocks.
+
+    Returns a sorted, de-duplicated list of tickers (typically a few thousand).
+    Needs network access at runtime (runs fine on Streamlit Cloud / your laptop).
+    """
+    import requests  # provided transitively by yfinance
+
+    headers = {"User-Agent": "Mozilla/5.0 (reversal-scanner)"}
+    symbols: set[str] = set()
+
+    nasdaq = requests.get(_NASDAQ_LISTED_URL, headers=headers, timeout=30)
+    symbols |= set(_parse_symbol_file(nasdaq.text, "Symbol"))
+
+    other = requests.get(_OTHER_LISTED_URL, headers=headers, timeout=30)
+    symbols |= set(_parse_symbol_file(other.text, "ACT Symbol"))
+
+    return sorted(symbols)
+
+
+def _batch_history(
+    symbols: list[str],
+    period: str,
+    interval: str,
+    chunk_size: int = 150,
+    pause: float = 0.5,
+    progress=None,
+) -> dict[str, pd.DataFrame]:
+    """Download OHLCV for many symbols in batches. -> {symbol: DataFrame}.
+
+    yfinance fetches a whole chunk in one HTTP request, which is the key speedup.
+    Symbols that fail or come back empty are simply omitted.
+    """
+    out: dict[str, pd.DataFrame] = {}
+    chunks = [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
+    done = 0
+    for chunk in chunks:
+        try:
+            data = yf.download(
+                chunk, period=period, interval=interval,
+                group_by="ticker", threads=True, progress=False, auto_adjust=True,
+            )
+        except Exception:
+            data = None
+
+        if data is not None and not data.empty:
+            if len(chunk) == 1:
+                df = data.dropna(how="all")
+                if not df.empty:
+                    out[chunk[0]] = df
+            else:
+                for sym in chunk:
+                    try:
+                        df = data[sym].dropna(how="all")
+                    except Exception:
+                        continue
+                    if not df.empty:
+                        out[sym] = df
+
+        done += len(chunk)
+        if progress is not None:
+            progress(done, len(symbols))
+        time.sleep(pause)
+    return out
+
+
+def run_scan_universe(
+    symbols: list[str],
+    cfg: ScanConfig | None = None,
+    max_symbols: int | None = None,
+    fetch_float_for_hits: bool = True,
+    progress_callback=None,
+) -> pd.DataFrame:
+    """Batched scan over a large symbol list (e.g. the whole US market).
+
+    Same filters and indicators as run_scan, but built for scale:
+      Phase 1  batch-download intraday + daily bars (no per-symbol float lookup)
+      Phase 2  apply the consecutive-candle / price / ATR / RVOL / volume filters
+      Phase 3  fetch float ONLY for the survivors, then apply the float cap
+    """
+    cfg = cfg or ScanConfig()
+    if max_symbols is not None:
+        symbols = symbols[:max_symbols]
+    n = len(symbols)
+    if n == 0:
+        return pd.DataFrame()
+
+    # Phase 1: two batched downloads. Report progress across both as one bar.
+    def intraday_progress(done, total):
+        if progress_callback:
+            progress_callback(done, total * 2, "Downloading intraday bars")
+
+    def daily_progress(done, total):
+        if progress_callback:
+            progress_callback(total + done, total * 2, "Downloading daily bars")
+
+    intraday = _batch_history(symbols, "1d", cfg.bar_interval, progress=intraday_progress)
+    daily = _batch_history(symbols, "6mo", "1d", progress=daily_progress)
+
+    # Phase 2: in-memory filtering (fast, no network).
+    if progress_callback:
+        progress_callback(n * 2, n * 2, "Applying filters")
+    hits = []
+    for sym in symbols:
+        bars, days = intraday.get(sym), daily.get(sym)
+        if bars is None or days is None or bars.empty or days.empty:
+            continue
+        price = float(bars["Close"].iloc[-1])
+        consec = count_consecutive_candles(bars, cfg.direction)
+        atr = average_true_range(days, cfg.atr_period)
+        rvol = relative_volume(days, cfg.rvol_lookback_days)
+        vol_today = float(days["Volume"].iloc[-1])
+
+        if consec < cfg.min_consecutive_candles:
+            continue
+        if not (cfg.min_price <= price <= cfg.max_price):
+            continue
+        if not (atr >= cfg.min_atr):
+            continue
+        if not (rvol >= cfg.min_rvol):
+            continue
+        if not (vol_today >= cfg.min_volume_today):
+            continue
+
+        hits.append({
+            "Symbol": sym,
+            "Consec": consec,
+            "Price": round(price, 2),
+            "Float(M)": None,            # filled in Phase 3 if requested
+            "ATR": round(atr, 2),
+            "VolToday": int(vol_today),
+            "RVOL": round(rvol, 2),
+        })
+
+    # Phase 3: float lookup for survivors only (the expensive .info call).
+    if fetch_float_for_hits and hits:
+        for row in hits:
+            flt = fetch_float_shares(yf.Ticker(row["Symbol"]))
+            row["Float(M)"] = round(flt / 1e6, 1) if flt else None
+        if cfg.max_float_shares is not None:
+            cap_m = cfg.max_float_shares / 1e6
+            hits = [r for r in hits if r["Float(M)"] is None or r["Float(M)"] <= cap_m]
+
+    df = pd.DataFrame(hits)
     if not df.empty:
         df = df.sort_values("RVOL", ascending=False).reset_index(drop=True)
     return df
